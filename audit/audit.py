@@ -97,8 +97,8 @@ class Audit(commands.Cog):
         self.invite_regex = re.compile(
             r"(?:https?://)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|(?:discordapp|discord)\.com/invite)/[\w]+"
         )
-        self.whname = "Modmail Audit Logger"
-        self.acname = "modmail-audit"
+        self.whname = "Servee Audit Log"
+        self.acname = "server-audit"
         self._webhooks = {}
         self._webhook_locks = {}
 
