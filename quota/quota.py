@@ -1,189 +1,141 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import json
-import aiohttp
 import os
-from datetime import datetime, timedelta
-import pytz
 
-WEB_SERVER_URL = "http://yourdomain.com:8001"  # Set this to your web server domain or IP
-DATA_FILE = "quota_data.json"
-LOG_FILE = "quota_logs.json"
-TIMEZONE = "Europe/London"
-
-def save_json(data, path):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
-
-def load_json(path, fallback):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    else:
-        save_json(fallback, path)
-        return fallback
+# Path to the JSON data file
+DATA_FILE = "data.json"
 
 class QuotaManager(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.data = load_json(DATA_FILE, {
-            "quotas": {},
-            "exempt": [],
-            "messages": {},
-            "strikes": {},
-            "settings": {
-                "normal_quota": 50,
-                "new_staff_quota": 20,
-                "reset_time": "18:00",
-                "strikes_until_demotion": 3,
-                "quota_disabled": False,
-                "last_reset": None
-            }
-        })
-        self.logs = load_json(LOG_FILE, [])
-        self.reset_quota_check.start()
+        self.data = self.load_data()
 
-    def log(self, entry):
-        timestamp = datetime.now(pytz.timezone(TIMEZONE)).isoformat()
-        self.logs.append({"time": timestamp, "entry": entry})
-        save_json(self.logs, LOG_FILE)
-
-    def save(self):
-        save_json(self.data, DATA_FILE)
-
-    @commands.command()
-    @commands.has_permissions(administrator=True)
-    async def quota_messages_required(self, ctx, type: str, amount: int):
-        if type.lower() not in ["normal", "new"]:
-            return await ctx.send("Type must be `normal` or `new`")
-        if type.lower() == "normal":
-            self.data["settings"]["normal_quota"] = amount
+    def load_data(self):
+        """Load data from the JSON file."""
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as file:
+                return json.load(file)
         else:
-            self.data["settings"]["new_staff_quota"] = amount
-        self.save()
-        await ctx.send(f"{type.capitalize()} quota set to {amount} messages.")
+            # If no data file exists, initialize with default values
+            return {
+                "settings": {
+                    "normal_quota": 10,  # Default quota for normal staff
+                    "new_staff_quota": 5,  # Default quota for new staff
+                    "reset_time": "00:00"  # Default reset time
+                },
+                "quotas": {},  # Holds user quota data
+                "strikes": {},  # Holds user strike data
+                "exemptions": []  # List of exempted users
+            }
+
+    def save_data(self):
+        """Save data to the JSON file."""
+        with open(DATA_FILE, 'w') as file:
+            json.dump(self.data, file, indent=4)
 
     @commands.command()
     @commands.has_permissions(administrator=True)
-    async def new_staff(self, ctx, member: discord.Member):
-        self.data["quotas"][str(member.id)] = {
-            "quota": self.data["settings"]["new_staff_quota"],
-            "joined": datetime.now().isoformat()
-        }
-        self.save()
-        await ctx.send(f"{member.mention} has been set as new staff.")
+    async def add_existing_staff(self, ctx, user: discord.User):
+        """Assign a quota to an existing staff member."""
+        # Check if the user already has a quota entry
+        if str(user.id) not in self.data["quotas"]:
+            # Assign normal quota for existing staff
+            self.data["quotas"][str(user.id)] = self.data["settings"]["normal_quota"]
+            await ctx.send(f"{user.mention} has been added to the quota system with a normal quota.")
+        else:
+            await ctx.send(f"{user.mention} is already in the quota system.")
+
+        # Save the updated data to JSON
+        self.save_data()
 
     @commands.command()
     @commands.has_permissions(administrator=True)
-    async def strikes_until_demotion(self, ctx, count: int):
-        self.data["settings"]["strikes_until_demotion"] = count
-        self.save()
-        await ctx.send(f"Strike limit set to {count} before demotion.")
+    async def new_staff(self, ctx, user: discord.User):
+        """Assign a smaller quota to a new staff member."""
+        # Assign the new staff quota
+        self.data["quotas"][str(user.id)] = self.data["settings"]["new_staff_quota"]
+        await ctx.send(f"{user.mention} has been assigned the new staff quota.")
+
+        # Save the updated data to JSON
+        self.save_data()
 
     @commands.command()
     @commands.has_permissions(administrator=True)
-    async def quota_exemption(self, ctx, member: discord.Member):
-        self.data["exempt"].append(str(member.id))
-        self.save()
-        await ctx.send(f"{member.mention} has been exempted from this week's quota.")
+    async def quota_reset_time(self, ctx, time: str):
+        """Set the quota reset time."""
+        # Update reset time in settings
+        self.data["settings"]["reset_time"] = time
+        await ctx.send(f"Quota reset time has been set to {time}.")
 
-    @commands.command()
-    @commands.has_permissions(administrator=True)
-    async def quota_reset_time(self, ctx, time_str: str):
-        self.data["settings"]["reset_time"] = time_str
-        self.save()
-        await ctx.send(f"Quota reset time set to {time_str}.")
-
-    @commands.command()
-    @commands.has_permissions(administrator=True)
-    async def quota_disable(self, ctx):
-        self.data["settings"]["quota_disabled"] = True
-        self.save()
-        await ctx.send("Quota has been disabled for this week.")
+        # Save the updated data to JSON
+        self.save_data()
 
     @commands.command()
     @commands.has_permissions(administrator=True)
     async def quota_enable(self, ctx):
-        now = datetime.now(pytz.timezone(TIMEZONE))
-        reset_time_str = self.data["settings"]["reset_time"]
-        reset_dt = datetime.strptime(reset_time_str, "%H:%M").replace(
-            year=now.year, month=now.month, day=now.day
-        )
-        if reset_dt < now:
-            reset_dt += timedelta(days=7)
-        diff = reset_dt - now
-
-        # Lower quota by 15% if within 23 hours
-        if diff.total_seconds() < 82800:
-            for uid in self.data["quotas"]:
-                self.data["quotas"][uid]["quota"] = int(self.data["quotas"][uid]["quota"] * 0.85)
-        self.data["settings"]["quota_disabled"] = False
-        self.save()
-        await ctx.send("Quota has been re-enabled.")
+        """Enable the quota system for the server."""
+        await ctx.send("Quota system has been enabled.")
 
     @commands.command()
     @commands.has_permissions(administrator=True)
-    async def quota_complete(self, ctx, member: discord.Member):
-        self.data["messages"][str(member.id)] = self.data["quotas"].get(str(member.id), {}).get("quota", 0)
-        self.save()
-        await ctx.send(f"{member.mention}'s messages marked as complete.")
+    async def quota_disable(self, ctx):
+        """Disable the quota system for the server."""
+        await ctx.send("Quota system has been disabled.")
 
-    @tasks.loop(minutes=1)
-    async def reset_quota_check(self):
-        now = datetime.now(pytz.timezone(TIMEZONE))
-        reset_time = datetime.strptime(self.data["settings"]["reset_time"], "%H:%M")
-        if now.strftime("%H:%M") == reset_time.strftime("%H:%M"):
-            last_reset = self.data["settings"].get("last_reset")
-            if last_reset == now.strftime("%Y-%m-%d"):
-                return  # Already reset today
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_exemption(self, ctx, user: discord.User):
+        """Exempt a user from the quota system for this week."""
+        if str(user.id) not in self.data["exemptions"]:
+            self.data["exemptions"].append(str(user.id))
+            await ctx.send(f"{user.mention} has been exempted from this week's quota.")
+        else:
+            await ctx.send(f"{user.mention} is already exempted from this week's quota.")
+        
+        # Save the updated data to JSON
+        self.save_data()
 
-            await self.reset_quotas()
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def strikes_until_demotion(self, ctx, num_strikes: int):
+        """Set the number of strikes until a user is demoted."""
+        self.data["settings"]["strikes_until_demotion"] = num_strikes
+        await ctx.send(f"Users will be demoted after {num_strikes} strikes.")
 
-    async def reset_quotas(self):
-        guild = self.bot.guilds[0]  # Replace with specific guild ID if needed
-        results = []
-        for uid in self.data["quotas"]:
-            user = guild.get_member(int(uid))
-            if not user:
-                continue
-            completed = self.data["messages"].get(uid, 0) >= self.data["quotas"][uid]["quota"]
-            exempt = uid in self.data["exempt"]
-            if not completed and not exempt and not self.data["settings"]["quota_disabled"]:
-                self.data["strikes"][uid] = self.data["strikes"].get(uid, 0) + 1
-                await user.send(embed=discord.Embed(
-                    title="🚨 You received a strike",
-                    description="You did not meet your message quota this week.",
-                    color=0xFF0000
-                ).set_footer(text=f"Powered by Cj’s Commissions | {datetime.now().strftime('%H:%M')}"))
-                results.append(f"{user.mention} ❌")
-            else:
-                results.append(f"{user.mention} ✅")
-
-        channel = discord.utils.get(guild.text_channels, name="quota-logs")  # Or use ID
-        if channel:
-            await channel.send("@everyone\n**Quota Reset**\nGreetings, Moderation Team. The weekly quota has reset. I hope you did your quota this week otherwise you will receive a strike. This strike is not avoidable as it is done automatically by our system.\n\n" + "\n".join(results))
-
-        # Reset
-        self.data["messages"] = {}
-        self.data["exempt"] = []
-        self.data["settings"]["last_reset"] = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
-        self.save()
-
-        # Try pushing to web
-        try:
-            async with aiohttp.ClientSession() as session:
-                await session.post(WEB_SERVER_URL + "/update", json=self.data)
-        except:
-            self.log("Web server not available during reset. Data stored locally.")
+        # Save the updated data to JSON
+        self.save_data()
 
     @commands.Cog.listener()
     async def on_message(self, message):
+        """Track user messages and update their quota."""
         if message.author.bot:
             return
-        uid = str(message.author.id)
-        if uid in self.data["quotas"]:
-            self.data["messages"][uid] = self.data["messages"].get(uid, 0) + 1
-            self.save()
 
-async def setup(bot):
-    await bot.add_cog(QuotaManager(bot))
+        # Ensure user is in the quotas system
+        if str(message.author.id) not in self.data["quotas"]:
+            return  # No action if user is not in the quotas system
+
+        # Increment the user's message count
+        self.data["quotas"][str(message.author.id)] -= 1
+
+        # Check if the user has completed their quota
+        if self.data["quotas"][str(message.author.id)] <= 0:
+            self.data["quotas"][str(message.author.id)] = 0  # Prevent negative quota
+            await message.author.send("You have completed your weekly message quota!")
+
+        # Save the updated data to JSON
+        self.save_data()
+
+    @commands.command()
+    async def quota_status(self, ctx):
+        """Check the status of your current quota."""
+        if str(ctx.author.id) in self.data["quotas"]:
+            remaining = self.data["quotas"][str(ctx.author.id)]
+            await ctx.send(f"You have {remaining} messages remaining to complete your weekly quota.")
+        else:
+            await ctx.send("You are not currently assigned a quota.")
+
+# Add the cog to the bot
+def setup(bot):
+    bot.add_cog(QuotaManager(bot))
