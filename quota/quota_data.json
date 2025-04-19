@@ -1,0 +1,16 @@
+{
+    "quota_enabled": true,
+    "quota_reset_time": "13:00",
+    "quota_reset_day": "Sunday",
+    "strikes_until_demotion": 3,
+    "staff_roles": {
+        "normal": {
+            "message_count": 100
+        },
+        "new_staff": {
+            "message_count": 50
+        }
+    },
+    "users": {},
+    "log": []
+}
