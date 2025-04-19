@@ -1,17 +1,20 @@
 {
-    "quota_enabled": true,
-    "quota_reset_time": "00:00",
-    "quota_reset_day": "Sunday",
-    "strikes_until_demotion": 3,
-    "staff_roles": {
-        "normal": {
-            "message_count": 100
-        },
-        "new_staff": {
-            "message_count": 50
-        }
+  "users": {},
+  "exemptions": [],
+  "strikes": {},
+  "weekly_quota_enabled": true,
+  "reset_time": "18:00",
+  "reset_day": "Sunday",
+  "strike_threshold": 3,
+  "log": [],
+  "staff_roles": {
+    "normal": {
+      "message_count": 100
     },
-    "users": {},
-    "log": [],
-    "reset_announcement": "@everyone\n**Quota Reset**\nGreetings, Moderation Team. The weekly quota has reset. I hope you did your quota this week otherwise you will receive a strike. This strike is not avoidable as it is done automatically by our system.\n[USERPING] [TICK FOR COMPLETE AND X FOR NOT COMPLETE] keep going for every user in the team."
+    "new": {
+      "message_count": 50
+    }
+  },
+  "reset_announcement": "@everyone\n**Quota Reset**\nGreetings, Moderation Team. The weekly quota has reset. I hope you did your quota this week otherwise you will receive a strike. This strike is not avoidable as it is done automatically by our system.\n[USERPING]",
+  "reset_channel_id": null
 }
