@@ -1,162 +1,189 @@
 import discord
 from discord.ext import commands, tasks
-import aiohttp
-import asyncio
 import json
+import aiohttp
 import os
 from datetime import datetime, timedelta
 import pytz
 
+WEB_SERVER_URL = "http://yourdomain.com:8001"  # Set this to your web server domain or IP
 DATA_FILE = "quota_data.json"
 LOG_FILE = "quota_logs.json"
-WEB_SERVER_URL = "https://quota.cjscommmissions.xyz"  # Update this if needed
+TIMEZONE = "Europe/London"
 
-TIMEZONE = pytz.timezone("Europe/London")
+def save_json(data, path):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
 
-
-def now_uk():
-    return datetime.now(TIMEZONE)
-
+def load_json(path, fallback):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    else:
+        save_json(fallback, path)
+        return fallback
 
 class QuotaManager(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.data = self.load_json(DATA_FILE)
-        self.logs = self.load_json(LOG_FILE)
-        self.web_online = True
-        self.last_heartbeat_sent = None
-        self.heartbeat_loop.start()
-        self.weekly_reset_loop.start()
+        self.data = load_json(DATA_FILE, {
+            "quotas": {},
+            "exempt": [],
+            "messages": {},
+            "strikes": {},
+            "settings": {
+                "normal_quota": 50,
+                "new_staff_quota": 20,
+                "reset_time": "18:00",
+                "strikes_until_demotion": 3,
+                "quota_disabled": False,
+                "last_reset": None
+            }
+        })
+        self.logs = load_json(LOG_FILE, [])
+        self.reset_quota_check.start()
 
-    def load_json(self, file):
-        if not os.path.exists(file):
-            return {}
-        with open(file, "r") as f:
-            return json.load(f)
+    def log(self, entry):
+        timestamp = datetime.now(pytz.timezone(TIMEZONE)).isoformat()
+        self.logs.append({"time": timestamp, "entry": entry})
+        save_json(self.logs, LOG_FILE)
 
-    def save_json(self, file, data):
-        with open(file, "w") as f:
-            json.dump(data, f, indent=4)
+    def save(self):
+        save_json(self.data, DATA_FILE)
 
-    def log_event(self, event):
-        timestamp = now_uk().isoformat()
-        self.logs[timestamp] = event
-        self.save_json(LOG_FILE, self.logs)
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_messages_required(self, ctx, type: str, amount: int):
+        if type.lower() not in ["normal", "new"]:
+            return await ctx.send("Type must be `normal` or `new`")
+        if type.lower() == "normal":
+            self.data["settings"]["normal_quota"] = amount
+        else:
+            self.data["settings"]["new_staff_quota"] = amount
+        self.save()
+        await ctx.send(f"{type.capitalize()} quota set to {amount} messages.")
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        print("Quota Manager loaded.")
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def new_staff(self, ctx, member: discord.Member):
+        self.data["quotas"][str(member.id)] = {
+            "quota": self.data["settings"]["new_staff_quota"],
+            "joined": datetime.now().isoformat()
+        }
+        self.save()
+        await ctx.send(f"{member.mention} has been set as new staff.")
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def strikes_until_demotion(self, ctx, count: int):
+        self.data["settings"]["strikes_until_demotion"] = count
+        self.save()
+        await ctx.send(f"Strike limit set to {count} before demotion.")
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_exemption(self, ctx, member: discord.Member):
+        self.data["exempt"].append(str(member.id))
+        self.save()
+        await ctx.send(f"{member.mention} has been exempted from this week's quota.")
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_reset_time(self, ctx, time_str: str):
+        self.data["settings"]["reset_time"] = time_str
+        self.save()
+        await ctx.send(f"Quota reset time set to {time_str}.")
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_disable(self, ctx):
+        self.data["settings"]["quota_disabled"] = True
+        self.save()
+        await ctx.send("Quota has been disabled for this week.")
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_enable(self, ctx):
+        now = datetime.now(pytz.timezone(TIMEZONE))
+        reset_time_str = self.data["settings"]["reset_time"]
+        reset_dt = datetime.strptime(reset_time_str, "%H:%M").replace(
+            year=now.year, month=now.month, day=now.day
+        )
+        if reset_dt < now:
+            reset_dt += timedelta(days=7)
+        diff = reset_dt - now
+
+        # Lower quota by 15% if within 23 hours
+        if diff.total_seconds() < 82800:
+            for uid in self.data["quotas"]:
+                self.data["quotas"][uid]["quota"] = int(self.data["quotas"][uid]["quota"] * 0.85)
+        self.data["settings"]["quota_disabled"] = False
+        self.save()
+        await ctx.send("Quota has been re-enabled.")
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def quota_complete(self, ctx, member: discord.Member):
+        self.data["messages"][str(member.id)] = self.data["quotas"].get(str(member.id), {}).get("quota", 0)
+        self.save()
+        await ctx.send(f"{member.mention}'s messages marked as complete.")
+
+    @tasks.loop(minutes=1)
+    async def reset_quota_check(self):
+        now = datetime.now(pytz.timezone(TIMEZONE))
+        reset_time = datetime.strptime(self.data["settings"]["reset_time"], "%H:%M")
+        if now.strftime("%H:%M") == reset_time.strftime("%H:%M"):
+            last_reset = self.data["settings"].get("last_reset")
+            if last_reset == now.strftime("%Y-%m-%d"):
+                return  # Already reset today
+
+            await self.reset_quotas()
+
+    async def reset_quotas(self):
+        guild = self.bot.guilds[0]  # Replace with specific guild ID if needed
+        results = []
+        for uid in self.data["quotas"]:
+            user = guild.get_member(int(uid))
+            if not user:
+                continue
+            completed = self.data["messages"].get(uid, 0) >= self.data["quotas"][uid]["quota"]
+            exempt = uid in self.data["exempt"]
+            if not completed and not exempt and not self.data["settings"]["quota_disabled"]:
+                self.data["strikes"][uid] = self.data["strikes"].get(uid, 0) + 1
+                await user.send(embed=discord.Embed(
+                    title="🚨 You received a strike",
+                    description="You did not meet your message quota this week.",
+                    color=0xFF0000
+                ).set_footer(text=f"Powered by Cj’s Commissions | {datetime.now().strftime('%H:%M')}"))
+                results.append(f"{user.mention} ❌")
+            else:
+                results.append(f"{user.mention} ✅")
+
+        channel = discord.utils.get(guild.text_channels, name="quota-logs")  # Or use ID
+        if channel:
+            await channel.send("@everyone\n**Quota Reset**\nGreetings, Moderation Team. The weekly quota has reset. I hope you did your quota this week otherwise you will receive a strike. This strike is not avoidable as it is done automatically by our system.\n\n" + "\n".join(results))
+
+        # Reset
+        self.data["messages"] = {}
+        self.data["exempt"] = []
+        self.data["settings"]["last_reset"] = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+        self.save()
+
+        # Try pushing to web
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(WEB_SERVER_URL + "/update", json=self.data)
+        except:
+            self.log("Web server not available during reset. Data stored locally.")
 
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot:
             return
-        user_id = str(message.author.id)
-
-        if self.data.get("quota_disabled", False):
-            return
-        if user_id in self.data.get("exempt", []):
-            return
-
-        self.data.setdefault("message_counts", {})
-        self.data["message_counts"][user_id] = self.data["message_counts"].get(user_id, 0) + 1
-        self.save_json(DATA_FILE, self.data)
-
-    @tasks.loop(minutes=15)
-    async def heartbeat_loop(self):
-        async with aiohttp.ClientSession() as session:
-            try:
-                payload = {
-                    "timestamp": now_uk().isoformat(),
-                    "bot_status": "online"
-                }
-                async with session.post(f"{WEB_SERVER_URL}/status", json=payload, timeout=10) as resp:
-                    if resp.status == 200:
-                        if not self.web_online:
-                            self.log_event("Bot back online and synced.")
-                        self.web_online = True
-                        await self.sync_with_web(session)
-            except Exception:
-                if self.web_online:
-                    self.log_event("Web server offline. Saving to JSON.")
-                self.web_online = False
-
-    async def sync_with_web(self, session):
-        payload = {
-            "data": self.data,
-            "logs": self.logs
-        }
-        await session.post(f"{WEB_SERVER_URL}/data", json=payload)
-
-    @tasks.loop(hours=1)
-    async def weekly_reset_loop(self):
-        now = now_uk()
-        reset_time_str = self.data.get("reset_time", "23:59")
-        reset_hour, reset_minute = map(int, reset_time_str.split(":"))
-        scheduled = now.replace(hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
-
-        if now > scheduled:
-            scheduled += timedelta(days=7)
-
-        wait_seconds = (scheduled - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-        await self.perform_weekly_reset()
-
-    async def perform_weekly_reset(self):
-        message_counts = self.data.get("message_counts", {})
-        quotas = self.data.get("quotas", {"normal": 100, "new": 50})
-        strikes = self.data.setdefault("strikes", {})
-        exempt = self.data.get("exempt", [])
-        new_staff = self.data.get("new_staff", [])
-        channel_id = self.data.get("log_channel")
-
-        results = []
-        for user_id, count in message_counts.items():
-            if user_id in exempt:
-                results.append((user_id, True, "Exempt"))
-                continue
-
-            required = quotas["new"] if user_id in new_staff else quotas["normal"]
-            if count >= required:
-                results.append((user_id, True, None))
-            else:
-                results.append((user_id, False, None))
-                strikes[user_id] = strikes.get(user_id, 0) + 1
-
-        self.data["message_counts"] = {}
-        self.data["exempt"] = []
-        self.save_json(DATA_FILE, self.data)
-        self.save_json(LOG_FILE, self.logs)
-
-        if self.web_online:
-            async with aiohttp.ClientSession() as session:
-                await self.sync_with_web(session)
-
-        if channel_id:
-            channel = self.bot.get_channel(channel_id)
-            if channel:
-                await channel.send("@everyone\n**Quota Reset**\nGreetings, Moderation Team. The weekly quota has reset...")
-                for user_id, passed, reason in results:
-                    user = await self.bot.fetch_user(int(user_id))
-                    if reason == "Exempt":
-                        msg = f"{user.mention} - ✅ (Exempt)"
-                    elif passed:
-                        msg = f"{user.mention} - ✅"
-                    else:
-                        msg = f"{user.mention} - ❌"
-                        await user.send(embed=self.create_strike_embed())
-                    await channel.send(msg)
-
-    def create_strike_embed(self):
-        embed = discord.Embed(
-            title="Quota Strike",
-            description="You did not meet your quota this week. A strike has been added.",
-            color=0xFF0000
-        )
-        embed.set_footer(text=f"Powered by Cj’s Commissions {now_uk().strftime('%H:%M')}")
-        return embed
-
-    # Add commands (e.g. quota_exemption, set quota, etc) here...
+        uid = str(message.author.id)
+        if uid in self.data["quotas"]:
+            self.data["messages"][uid] = self.data["messages"].get(uid, 0) + 1
+            self.save()
 
 async def setup(bot):
     await bot.add_cog(QuotaManager(bot))
